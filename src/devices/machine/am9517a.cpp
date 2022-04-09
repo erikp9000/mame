@@ -149,7 +149,14 @@ void am9517a_device::dma_request(int channel, bool state)
 {
 	LOG("AM9517A Channel %u DMA Request: %u\n", channel, state);
 
-	if (state)
+    // I arrived here because the Attache ROM programs the DMAC for
+    // an active low DREQ. The problem is that device_reset() sets
+    // m_status to 0 so the moment that the boot ROM clears the mask
+    // the DMAC triggers a DMA request, long before the FDC is ready.
+    // The solution would seem to be to consider the internal signal
+    // active high only and correct for an active low DREQ here.
+
+	if ((state && !COMMAND_DREQ_ACTIVE_LOW) || (!state && COMMAND_DREQ_ACTIVE_LOW))
 		m_status |= (1 << (channel + 4));
 	else
 		m_status &= ~(1 << (channel + 4));
@@ -191,7 +198,8 @@ void am9517a_device::set_mask_register(uint8_t mask)
 
 inline bool am9517a_device::is_request_active(int channel)
 {
-	return (BIT(COMMAND_DREQ_ACTIVE_LOW ? ~m_status : m_status, channel + 4) && !BIT(m_mask, channel)) ? true : false;
+    // Don't worry about high/low activation because dma_request() normalizes the DREQ.
+    return (BIT(m_status, channel + 4) && !BIT(m_mask, channel)) ? true : false;
 }
 
 
