@@ -247,11 +247,13 @@ void tms9927_device::write(offs_t offset, uint8_t data)
 
 		case 0x06:  /* LAST DISPLAYED DATA ROW */
 			// TVI-912 writes to this register frequently
-			if (m_reg[offset] != data)
-			{
+            // Attache relies the side-effect of recompute_parameters() to sync the upscroll on clear screen.
+            // Surely, other systems also rely on this.
+			//if (m_reg[offset] != data)
+			//{
 				m_reg[offset] = data;
 				recompute_parameters(false);
-			}
+			//}
 			break;
 
 		case 0x0c:  /* LOAD CURSOR CHARACTER ADDRESS */
