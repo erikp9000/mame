@@ -56,12 +56,12 @@
  *  It effectively allows the Attache to run MS-DOS and use a 10MB hard disk.
  *
  *  TODO:
- *    - Keyboard repeat
  *    - Get at least some of the system tests to pass
  *    - and probably lots more I've forgotten, too.
  *    - improve Z80-8086 comms on the 8:16, saving a file to the RAM disk under CP/M often ends in deadlock.
  *    - add Z8530 SCC and TMS9914A GPIB to the 8:16.  These are optional devices, so aren't strictly required at this stage.
  *    - connect dma and sio (channel 3)
+ *    - MUSIC.COM freezes on polling serial port B
  *
  * Updates: 27 Mar 2022
  * Erik Petersen
@@ -73,10 +73,12 @@
  *    - Added cursor rendering
  *    - Removed duplicate code
  *    - Fixed tms9927 driver which must recompute_parameters() when register 6 is written for scrolling to work after a clear screen
- *    - Enabled right SHIFT and CAPS LOCK keys
+ *    - Enabled right SHIFT and CTRL keys; enabled CAPS LOCK key
  *    - Corrected graphics to render relative to the upscroll_offset
  *    - Corrected reverse and highlight video per Attache demo disk
  *    - Fully support 8:16 secondary board I/O and memory traps
+ *    - Fixed issue with phantom key presses (e.g., : and ;) upon releasing SHIFT
+ *    - Added key repeat
  */
 
 #include "emu.h"
@@ -462,8 +464,20 @@ uint32_t attache_state::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 		bitmap.fill(0);
 
 	// Text output
-	uint8_t dbl_mode = 0;  // detemines which half of character to display when using double size attribute,
-							// as it can start on either odd or even character cells.
+	uint8_t dbl_mode = 0;  // determines which half of character to display when using double size attribute,
+						   // as it can start on either odd or even character cells.
+
+    // Get cursor coordinates
+    rectangle cursor;
+    if(m_crtc->cursor_bounds(cursor))
+    {
+        // The ROM & BIOS seem to advance the cursor position an extra character to the right
+        cursor.min_x = (cursor.min_x/8) -1;
+        cursor.max_x = (cursor.max_x/8) -1;
+        cursor.min_y /= 10;
+        cursor.max_y /= 10;
+    }
+
 	for(uint8_t y=0;y<m_lines;y++)  // lines
 	{
 		uint8_t const vy = (start + y) % m_lines;
@@ -531,31 +545,22 @@ uint32_t attache_state::screen_update(screen_device &screen, bitmap_rgb32 &bitma
 					data = newdata;
 				}
 
+                // If we are drawing in the area of the cursor, use reverse video
+                if(x >= cursor.min_x && x <= cursor.max_x &&
+                   y >= cursor.min_y && y <= cursor.max_y)
+                    data = ~data;
+
 				for(uint8_t bit=0;bit<8;bit++)  // 8 pixels per character
 				{
 					uint16_t const xpos = x*8+bit;
 					uint16_t const ypos = y*10+scan;
-
+                    
 					if(BIT(data,7-bit))
 						bitmap.pix(ypos,xpos) = fg;
 				}
 			}
 		}
 	}
-    
-    // check if cursor is visible
-    rectangle cursor;
-    if(m_crtc->cursor_bounds(cursor))
-    {
-        // The ROM & BIOS seem to advance the cursor position an extra character to the right
-        bitmap.plot_box(
-            cursor.min_x >= 8 ? cursor.min_x - 8 : cursor.min_x, 
-            cursor.min_y, 
-            cursor.max_x - cursor.min_x, 
-            cursor.max_y - cursor.min_y, 
-            m_palette->pen(1) //normal intensity (0=black, 2=intense)
-        );
-    }
     
 	return 0;
 }
@@ -591,9 +596,9 @@ uint16_t attache_state::get_key()
                 res |= 0x80; // no shift
 				m_kb_empty = false;
 				data = m_kb_mod->read();
-                if((data & 0x01) || (data & 0x04) || (data & 0x08))
+                if(data & (0x01 | 0x04 | 0x08))
 					res &= 0x7F;  // shift
-				if(data & 0x02)
+				if(data & (0x02 | 0x10))
 					res |= 0x40;  // ctrl
 				//logerror("KB: hit row %i, bit %i, shift %i, ctrl %i\n",row,bits,res&0x80?0:1,res&0x40?1:0);
 				return res;
@@ -607,19 +612,44 @@ uint16_t attache_state::get_key()
 
 uint8_t attache_state::keyboard_data_r()
 {
+    static attotime start;
+    static s64 delay;
 	uint16_t key;
 	if(m_kb_bitpos == 1)  // start bit, if data is available
 	{
 		key = get_key();
-		if(m_kb_current_key != key)
-			m_kb_current_key = key;
-		else
-			return 0x00;
-		//logerror("KB: bit position %i, key %02x, empty %i\n",m_kb_bitpos,m_kb_current_key,m_kb_empty);
+
+        // just return if no key pressed
 		if(m_kb_empty)
-			return 0x00;
+        {
+            m_kb_current_key = key;
+			return 0x00; // no key, no start bit
+        }
+              
+        if((m_kb_current_key == 0) ||  // detect keypress
+           ((m_kb_current_key & 0x3F) != (key & 0x3F)))  // allow key rollover
+        {
+            //logerror("KB: current %02x new %02x\n", m_kb_current_key, key);
+            // return keypress
+			m_kb_current_key = key;
+            start = machine().time();
+            delay = 1000;
+        }
+        else if(machine().time() - start > attotime::from_msec(delay))
+        {
+            // repeat the keypress 20 per second
+            start = machine().time();
+            delay = 50;
+        }        
 		else
-			return 0x40;
+        {
+            // wait for key release
+			return 0x00;
+        }
+        
+		//logerror("KB: bit position %i, key %02x, empty %i\n",m_kb_bitpos,m_kb_current_key,m_kb_empty);
+
+        return 0x40; // return start bit
 	}
 	else
 	{
@@ -1073,8 +1103,8 @@ uint8_t attache816_state::pio2_portA_r()
     else if(!(portb & U16_RD)) // select high-byte of address/data to port a
         retval = m_8086_latches >> 8;
 
-    logerror("pio2_portA_r U13_RD=%d U16_RD=%d ret=%02x\n", 
-        (portb & U13_RD) ? 1 : 0, (portb & U16_RD) ? 1 : 0, retval);
+    //logerror("pio2_portA_r U13_RD=%d U16_RD=%d ret=%02x\n", 
+    //    (portb & U13_RD) ? 1 : 0, (portb & U16_RD) ? 1 : 0, retval);
         
     return retval;
 }
@@ -1114,20 +1144,20 @@ void attache816_state::clear_8086_interrupt(uint8_t data)
 void attache816_state::write_low_byte(uint8_t data) // actually 'odd' byte
 {
     uint8_t porta = m_pio2->port_a_read(); // read PIO output latch
-    logerror("write_low_byte %02x\n", porta);
+    //logerror("write_low_byte %02x\n", porta);
     m_8086_data_bus = (m_8086_data_bus & 0x00ff) | (porta << 8);
 }
 
 void attache816_state::write_high_byte(uint8_t data) // actually 'even' byte
 {
     uint8_t porta = m_pio2->port_a_read(); // read PIO output latch
-    logerror("write_high_byte %02x\n", porta);
+    //logerror("write_high_byte %02x\n", porta);
     m_8086_data_bus = (m_8086_data_bus & 0xff00) | porta;
 }
 
 void attache816_state::clock_8086_data(uint8_t data)
 {
-    logerror("clock_8086_data\n");
+    //logerror("clock_8086_data\n");
     m_8086_latches = m_8086_data_bus;
 }
 
@@ -1135,7 +1165,7 @@ void attache816_state::clock_8086_data(uint8_t data)
 // Copy Z80 response to read operations to 8086 and clear halt; reset Z80 interrupts
 void attache816_state::run_8086(uint8_t data)
 {
-    logerror("run_8086\n");
+    //logerror("run_8086\n");
     
     m_halted = false;
     
@@ -1232,8 +1262,8 @@ uint16_t attache816_state::x86_trap_io_r(offs_t offset, uint16_t mem_mask)
 
 void attache816_state::x86_trap_mem_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
-    logerror("x86_trap_mem_w portb=%02x write %04x to addr=%04x mem_mask=%04x\n", 
-        m_pio2_portB_inputs, data, offset, mem_mask);    
+    //logerror("x86_trap_mem_w portb=%02x write %04x to addr=%04x mem_mask=%04x\n", 
+    //    m_pio2_portB_inputs, data, offset, mem_mask);    
 
     set_addr_decode_bits(offset, mem_mask);     // set AD0 and BHE
 
@@ -1244,8 +1274,8 @@ void attache816_state::x86_trap_mem_w(offs_t offset, uint16_t data, uint16_t mem
 
 uint16_t attache816_state::x86_trap_mem_r(offs_t offset, uint16_t mem_mask)
 {
-    logerror("x86_trap_mem_r portb=%02x read addr=%04x mem_mask=%04x\n", 
-        m_pio2_portB_inputs, offset, mem_mask);
+    //logerror("x86_trap_mem_r portb=%02x read addr=%04x mem_mask=%04x\n", 
+    //    m_pio2_portB_inputs, offset, mem_mask);
 
     set_addr_decode_bits(offset, mem_mask);     // set AD0 and BHE
 
@@ -1427,6 +1457,7 @@ static INPUT_PORTS_START(attache)
 	PORT_BIT(0x02,IP_ACTIVE_HIGH,IPT_KEYBOARD) PORT_NAME("Ctrl") PORT_CODE(KEYCODE_LCONTROL) PORT_CHAR(UCHAR_SHIFT_2)
 	PORT_BIT(0x04,IP_ACTIVE_HIGH,IPT_KEYBOARD) PORT_NAME("Shift") PORT_CODE(KEYCODE_RSHIFT) PORT_CHAR(UCHAR_SHIFT_1)
     PORT_BIT(0x08,IP_ACTIVE_HIGH,IPT_KEYBOARD) PORT_NAME("CAPS LOCK") PORT_CODE(KEYCODE_CAPSLOCK) PORT_CHAR(UCHAR_MAMEKEY(CAPSLOCK))
+	PORT_BIT(0x10,IP_ACTIVE_HIGH,IPT_KEYBOARD) PORT_NAME("Ctrl") PORT_CODE(KEYCODE_RCONTROL) PORT_CHAR(UCHAR_SHIFT_2)
 INPUT_PORTS_END
 
 // IRQ daisy chain = CTC -> SIO -> Expansion
